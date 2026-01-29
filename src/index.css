@@ -1,0 +1,81 @@
+@import "tailwindcss";
+
+@theme {
+  --color-sarus-red: #DC2626;
+  --color-sarus-body: #F3F4F6;
+  --color-sarus-text: #000000;
+  --color-sarus-desc: #374151;
+}
+
+body {
+  background-color: var(--color-sarus-body);
+  color: var(--color-sarus-text);
+  font-family: 'Inter', system-ui, sans-serif;
+}
+
+@keyframes aurora-1 {
+  0% {
+    transform: translate(0, 0) scale(1);
+  }
+
+  33% {
+    transform: translate(10px, -20px) scale(1.1);
+  }
+
+  66% {
+    transform: translate(-10px, 10px) scale(0.9);
+  }
+
+  100% {
+    transform: translate(0, 0) scale(1);
+  }
+}
+
+@keyframes aurora-2 {
+  0% {
+    transform: translate(0, 0) scale(1);
+  }
+
+  33% {
+    transform: translate(-15px, -15px) scale(1.05);
+  }
+
+  66% {
+    transform: translate(15px, 5px) scale(0.95);
+  }
+
+  100% {
+    transform: translate(0, 0) scale(1);
+  }
+}
+
+.animate-aurora-1 {
+  animation: aurora-1 8s ease-in-out infinite;
+}
+
+.animate-aurora-2 {
+  animation: aurora-2 10s ease-in-out infinite;
+}
+
+.text-shadow-sm {
+  text-shadow: 0 2px 4px rgba(255, 255, 255, 0.5);
+}
+
+@keyframes wave-flow {
+  0% {
+    transform: scaleY(1);
+  }
+
+  50% {
+    transform: scaleY(1.1);
+  }
+
+  100% {
+    transform: scaleY(1);
+  }
+}
+
+.animate-wave-flow {
+  animation: wave-flow 4s ease-in-out infinite;
+  transform-origin: bottom;
+}
