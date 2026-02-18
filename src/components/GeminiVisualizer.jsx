@@ -1,4 +1,5 @@
 import React, { useRef, useEffect } from 'react';
+import { examineeService } from '../services/examineeService';
 
 // Simple 2D Noise implementation (Pseudo-random)
 const noise2D = (x, y) => {
@@ -26,16 +27,19 @@ const smoothNoise = (x, y, t) => {
     return (a * (1 - u) + b * u) * (1 - v) + (c * (1 - u) + d * u) * v;
 };
 
-const GeminiVisualizer = ({ audioData, isSpeaking }) => {
+const GeminiVisualizer = () => {
     const canvasRef = useRef(null);
     const timeRef = useRef(0);
-    const audioDataRef = useRef(audioData);
+    const audioDataRef = useRef({ low: 0, mid: 0, high: 0 });
     const smoothedAudioRef = useRef({ low: 0, mid: 0, high: 0 }); // For smoothing
 
-    // Sync prop to ref on every render
+    // Subscribe to reactive audio data
     useEffect(() => {
-        audioDataRef.current = audioData;
-    }, [audioData]);
+        const sub = examineeService.audioData$.subscribe(data => {
+            audioDataRef.current = data;
+        });
+        return () => sub.unsubscribe();
+    }, []);
 
     useEffect(() => {
         const canvas = canvasRef.current;
