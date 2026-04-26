@@ -2,6 +2,6 @@ faster-whisper
 websockets
 numpy
 python-dotenv
-google-generativeai
+ollama
 fastapi
 uvicorn

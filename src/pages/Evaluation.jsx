@@ -1,115 +1,62 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import GeminiVisualizer from '../components/GeminiVisualizer';
 import ErrorOverlay from '../components/ErrorOverlay';
 import craneAgent from '../assets/Crane AI Agent.png';
+
+// --- Decoupled RxJS Services ---
 import { examineeService } from '../services/examineeService';
+import { audioService } from '../services/audioService';
 
 function Evaluation() {
-    // --- State ---
-    const [stage, setStage] = useState('Introduction'); // Introduction, CueCard, Discussion, Evaluation
-    const [status, setStatus] = useState('Wait'); // 'Wait', 'Your Turn', 'Prep', 'Speaking'
-    const [isSpeaking, setIsSpeaking] = useState(false); // User is recording
-    const [isAiSpeaking, setIsAiSpeaking] = useState(false); // AI is speaking
-    const [testStarted, setTestStarted] = useState(false); // User clicked 'Start'
-    const [error, setError] = useState(null); // Quota or system errors
-    const [cueCardWaiting, setCueCardWaiting] = useState(false); // Transition state for Part 2
-
+    // --- UI State (Synced strictly via RxJS Observables) ---
+    const [stage, setStage] = useState('Introduction'); 
+    const [status, setStatus] = useState('Wait'); 
+    const [isSpeaking, setIsSpeaking] = useState(false); // User recording state
+    const [isAiSpeaking, setIsAiSpeaking] = useState(false); 
+    const [testStarted, setTestStarted] = useState(false); 
+    const [error, setError] = useState(null); 
+    
     // Content state
-    const [aiQuestion, setAiQuestion] = useState("Connecting to IELTS Examiner...");
+    const [aiQuestion, setAiQuestion] = useState("Connected. Waiting for Examiner...");
     const [userTranscript, setUserTranscript] = useState("");
 
     // Timers for Part 2
-    const [prepTimeLeft, setPrepTimeLeft] = useState(60); // 1 minute
-    const [speakingSeconds, setSpeakingSeconds] = useState(0); // Count up
+    const [prepTimeLeft, setPrepTimeLeft] = useState(60); 
+    const [speakingSeconds, setSpeakingSeconds] = useState(0); 
     const [isPrepActive, setIsPrepActive] = useState(false);
     const [isRecordTimerActive, setIsRecordTimerActive] = useState(false);
 
-    // Refs
-    const websocketRef = useRef(null);
-    const mediaRecorderRef = useRef(null);
-    const mediaStreamRef = useRef(null);
-    const audioContextRef = useRef(null);
-    const analyserRef = useRef(null);
-    const dataArrayRef = useRef(null);
-    const sourceRef = useRef(null);
-    const rafIdRef = useRef(null);
-
-    // --- RxJS Subscriptions ---
+    // --- Core RxJS Subscriptions ---
     useEffect(() => {
         const subs = [
             examineeService.status$.subscribe(setStatus),
+            examineeService.stage$.subscribe(newStage => {
+                setStage(newStage);
+            }),
             examineeService.aiResponse$.subscribe(resp => {
-                if (resp.type === 'response') {
-                    setAiQuestion(resp.text);
-                    setStage(resp.stage);
-                    if (resp.stage === 'CueCard') startCueCardPhase();
-                    else if (resp.stage === 'Evaluation') setStatus('Exam Finished');
-                    else setStatus('Your Turn');
-                } else if (resp.type === 'error') {
-                    setError(resp.text);
-                }
+                if (resp && resp.type === 'response') setAiQuestion(resp.text);
             }),
             examineeService.userTranscript$.subscribe(setUserTranscript),
-            examineeService.audioData$.subscribe(data => {
-                // This component doesn't need to store audioData locally anymore,
-                // but it subscribes to ensure the service is active.
-                // The GeminiVisualizer will subscribe directly.
-            }),
-            examineeService.isAiSpeaking$.subscribe(setIsAiSpeaking)
+            examineeService.isAiSpeaking$.subscribe(setIsAiSpeaking),
+            
+            // Map Audio service directly to UI
+            audioService.isRecording$.subscribe(setIsSpeaking),
+            audioService.microphoneError$.subscribe(setError)
         ];
-
+        
         return () => subs.forEach(s => s.unsubscribe());
-    }, []);
+    }, [isPrepActive, speakingSeconds, prepTimeLeft]);
 
-    // --- WebSocket Connection ---
+    // --- Part 2 Cue Card Timer Orchestration ---
     useEffect(() => {
-        let timeoutId;
-        const connectWrapper = () => {
-            const ws = new WebSocket("ws://localhost:8000/listen");
-            websocketRef.current = ws;
-
-            ws.onopen = () => {
-                console.log("WebSocket Connected");
-                setAiQuestion("Connected. Waiting for Examiner...");
-            };
-
-            ws.onmessage = (event) => {
-                try {
-                    const data = JSON.parse(event.data);
-                    if (data.type === 'preview') {
-                        examineeService.updateTranscript(data.text);
-                    } else {
-                        examineeService.emitResponse(data);
-                    }
-                } catch (e) {
-                    console.error("WS parse error:", e);
-                }
-            };
-            ws.onerror = () => setAiQuestion("Connection Error. Is the backend running?");
-        };
-        timeoutId = setTimeout(connectWrapper, 100);
-        return () => {
-            clearTimeout(timeoutId);
-            if (websocketRef.current) websocketRef.current.close();
-        };
-    }, []);
-
-    // --- Part 2 Timers ---
-
-    const startCueCardPhase = () => {
-        setCueCardWaiting(true);
-    };
-
-    // Effect to trigger Part 2 Prep only after AI stops talking
-    useEffect(() => {
-        if (stage === 'CueCard' && cueCardWaiting && !isAiSpeaking) {
+        if (stage === 'CueCard' && !isAiSpeaking && prepTimeLeft === 60 && speakingSeconds === 0 && !isPrepActive && !isRecordTimerActive) {
+            // Wait for AI to finish dictating instructions before starting the Prep countdown
             setStatus('Prep Time');
             setIsPrepActive(true);
-            setPrepTimeLeft(60);
-            setCueCardWaiting(false);
+            audioService.setPrepActive(true);
         }
-    }, [isAiSpeaking, stage, cueCardWaiting]);
+    }, [stage, isAiSpeaking, prepTimeLeft, speakingSeconds, isPrepActive, isRecordTimerActive]);
 
     useEffect(() => {
         let interval = null;
@@ -118,11 +65,11 @@ function Evaluation() {
                 setPrepTimeLeft(prev => prev - 1);
             }, 1000);
         } else if (isPrepActive && prepTimeLeft === 0) {
-            // Prep Finished -> Start Recording
+            // Prep Finished -> Force Start Recording
             setIsPrepActive(false);
-            startRecordingTurn(); // Auto start recording
+            audioService.setPrepActive(false);
+            examineeService.resumeUserTurn(); // Tells service to kick on the mic
             setIsRecordTimerActive(true);
-            setRecordTimeLeft(120);
             setStatus('Speaking Time');
         }
         return () => clearInterval(interval);
@@ -130,22 +77,32 @@ function Evaluation() {
 
     useEffect(() => {
         let interval = null;
-        if (isRecordTimerActive) {
+        if (isRecordTimerActive && isSpeaking) {
             interval = setInterval(() => {
-                setSpeakingSeconds(prev => prev + 1);
+                setSpeakingSeconds(prev => {
+                    const next = prev + 1;
+                    
+                    if (stage === 'CueCard') {
+                        if (next < 120) {
+                            audioService.setVadActive(false); // Force keep listening
+                        } else {
+                            audioService.setVadActive(true); // Allow VAD to cut
+                        }
+                    }
+
+                    if (next >= 180) { // Hard limit at 3 mins
+                        setIsRecordTimerActive(false);
+                        audioService.stopRecordingTurn();
+                        examineeService.forceStageChange("Discussion"); 
+                    }
+                    return next;
+                });
             }, 1000);
         }
-
-        // Hard stop at 3 minutes (180 seconds)
-        if (speakingSeconds >= 180) {
-            setIsRecordTimerActive(false);
-            stopRecordingTurn(true);
-        }
-
         return () => clearInterval(interval);
-    }, [isRecordTimerActive, speakingSeconds]);
+    }, [isRecordTimerActive, speakingSeconds, isSpeaking]);
 
-    // Dynamic Status for Part 2 Speaking
+    // Dynamic Status text for Part 2
     useEffect(() => {
         if (stage === 'CueCard' && isSpeaking) {
             if (isPrepActive) {
@@ -163,143 +120,12 @@ function Evaluation() {
     }, [speakingSeconds, stage, isSpeaking, isPrepActive, prepTimeLeft]);
 
 
-    // --- Audio Logic ---
-
-    const startRecordingTurn = async () => {
-        if (isSpeaking) return;
-
-        try {
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            mediaStreamRef.current = stream;
-            startAudioAnalysis(stream);
-
-            mediaRecorderRef.current = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
-
-            mediaRecorderRef.current.ondataavailable = (event) => {
-                if (event.data.size > 0 && websocketRef.current?.readyState === WebSocket.OPEN) {
-                    websocketRef.current.send(event.data);
-                }
-            };
-
-            // Synchronization logic: Send COMMIT only AFTER the last chunk is sent
-            mediaRecorderRef.current.onstop = () => {
-                if (websocketRef.current?.readyState === WebSocket.OPEN) {
-                    // Critical: COMMIT must be sent AFTER dataavailable has fired for the last time
-                    setTimeout(() => {
-                        websocketRef.current.send(JSON.stringify({ text: "COMMIT" }));
-                    }, 50);
-                }
-            };
-
-            mediaRecorderRef.current.start(250);
-            setIsSpeaking(true);
-
-            if (stage === 'CueCard') {
-                setIsRecordTimerActive(true);
-                setSpeakingSeconds(0);
-            } else {
-                examineeService.setStatus('Recording...');
-            }
-            examineeService.updateTranscript("");
-
-        } catch (err) {
-            console.error("Mic error:", err);
-            examineeService.setStatus("Mic Error");
-        }
+    // --- Boot ---
+    const handleStartExam = async () => {
+        setTestStarted(true);
+        await examineeService.startExamination();
     };
 
-    const stopRecordingTurn = (forceNextStage = false) => {
-        if (!isSpeaking && !forceNextStage) return;
-
-        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-            mediaRecorderRef.current.stop();
-        }
-
-        stopAudioAnalysis();
-        if (mediaStreamRef.current) {
-            mediaStreamRef.current.getTracks().forEach(track => track.stop());
-            mediaStreamRef.current = null;
-        }
-
-        setIsSpeaking(false);
-        examineeService.setStatus('Wait');
-
-        // Logic for forced transitions (timers)
-        if (forceNextStage && websocketRef.current?.readyState === WebSocket.OPEN) {
-            if (stage === 'CueCard') {
-                websocketRef.current.send(JSON.stringify({ text: "STAGE_CHANGE:Discussion" }));
-            }
-        }
-    };
-
-    const handleToggle = () => {
-        if (stage === 'Evaluation') return;
-        if (isPrepActive) return;
-
-        if (isSpeaking) {
-            // Part 2 constraints: Cannot stop before 2 minutes
-            if (stage === 'CueCard' && speakingSeconds < 120) {
-                alert("Please continue speaking. You need to talk for at least 2 minutes for Part 2.");
-                return;
-            }
-            stopRecordingTurn();
-        } else {
-            startRecordingTurn();
-        }
-    };
-
-    const handleStartExam = () => {
-        if (websocketRef.current?.readyState === WebSocket.OPEN) {
-            setTestStarted(true);
-            websocketRef.current.send(JSON.stringify({ text: "START_EXAM" }));
-            // Unlock speech synthesis by playing an empty utterance
-            examineeService.unlockSpeechSynthesis();
-        } else {
-            setAiQuestion("Still connecting... please wait.");
-        }
-    };
-
-    // --- Helpers ---
-    const startAudioAnalysis = (stream) => {
-        if (!audioContextRef.current) audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
-        if (audioContextRef.current.state === 'suspended') audioContextRef.current.resume();
-
-        analyserRef.current = audioContextRef.current.createAnalyser();
-        analyserRef.current.fftSize = 512;
-        dataArrayRef.current = new Uint8Array(analyserRef.current.frequencyBinCount);
-
-        sourceRef.current = audioContextRef.current.createMediaStreamSource(stream);
-        sourceRef.current.connect(analyserRef.current);
-
-        const update = () => {
-            if (analyserRef.current) {
-                analyserRef.current.getByteFrequencyData(dataArrayRef.current);
-                // Calculate simple averages for low/mid/high
-                const length = dataArrayRef.current.length;
-                const lowAvg = dataArrayRef.current.slice(0, Math.floor(length * 0.1)).reduce((a, b) => a + b, 0) / (length * 0.1) || 0;
-                const midAvg = dataArrayRef.current.slice(Math.floor(length * 0.1), Math.floor(length * 0.5)).reduce((a, b) => a + b, 0) / (length * 0.4) || 0;
-                const highAvg = dataArrayRef.current.slice(Math.floor(length * 0.5)).reduce((a, b) => a + b, 0) / (length * 0.5) || 0;
-
-                // Update service's audio stream
-                examineeService.updateAudioData({
-                    low: lowAvg / 255,
-                    mid: midAvg / 255,
-                    high: highAvg / 255
-                });
-            }
-            rafIdRef.current = requestAnimationFrame(update);
-        };
-        update();
-    };
-
-    const stopAudioAnalysis = () => {
-        if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current);
-        examineeService.updateAudioData({ low: 0, mid: 0, high: 0 }); // Reset audio data in service
-    };
-
-    // --- Render ---
-
-    // Format Phase Name
     const getStageName = () => {
         switch (stage) {
             case 'Introduction': return 'Stage 1: Introduction';
@@ -308,6 +134,26 @@ function Evaluation() {
             case 'Evaluation': return 'Final Evaluation';
             default: return 'IELTS Exam';
         }
+    };
+
+    const renderCueCardContent = (text) => {
+        if (!text.includes('•')) return <div className="text-lg md:text-xl font-medium">{text}</div>;
+        
+        const parts = text.split('•');
+        const header = parts[0].trim();
+        const bullets = parts.slice(1).map((b, i) => (
+            <li key={i} className="ml-6 list-disc marker:text-sarus-red mb-2 text-slate-700 font-medium">{b.trim()}</li>
+        ));
+
+        return (
+            <div className="bg-white border-2 border-slate-200 shadow-lg rounded-2xl p-6 md:p-8 my-4 relative animate-in fade-in slide-in-from-bottom-4 duration-700">
+                 <div className="absolute top-0 right-8 -mt-3 bg-white px-3 border border-slate-100 rounded-full shadow-sm text-xs font-bold text-slate-400 uppercase tracking-widest">Candidate Task Card</div>
+                 <p className="font-bold text-slate-800 text-xl mb-6">{header.replace(/TOPIC:/i, '').trim()}</p>
+                 <ul className="text-base md:text-lg space-y-3">
+                     {bullets}
+                 </ul>
+            </div>
+        );
     };
 
     return (
@@ -325,7 +171,7 @@ function Evaluation() {
             {/* Main Content */}
             <div className="flex-1 w-full max-w-6xl mx-auto flex flex-col items-center justify-center px-4 relative z-10 block-content pt-20">
 
-                {/* Question / Response Card */}
+                {/* Card */}
                 <div className={`w-full max-w-4xl bg-gray-100/90 rounded-3xl p-8 md:p-12 shadow-sm backdrop-blur-md mb-8 transition-all duration-500 border-2 flex flex-col md:flex-row items-start gap-8 ${isSpeaking ? 'border-sarus-red/50 shadow-[0_0_30px_rgba(220,38,38,0.2)]' : 'border-transparent'}`}>
 
                     {/* Avatar */}
@@ -342,9 +188,7 @@ function Evaluation() {
                         {stage === 'CueCard' ? (
                             <div className="space-y-4">
                                 <h3 className="text-xs font-bold text-gray-500 uppercase tracking-widest">Your Topic</h3>
-                                <div className="text-lg md:text-xl font-medium text-evaluate-text leading-relaxed whitespace-pre-wrap">
-                                    {aiQuestion}
-                                </div>
+                                {renderCueCardContent(aiQuestion)}
                                 <div className="flex gap-4 pt-4 border-t border-gray-200 mt-4">
                                     {isPrepActive ? (
                                         <div className="flex items-center gap-2">
@@ -370,25 +214,12 @@ function Evaluation() {
                     </div>
                 </div>
 
-                {/* Interaction Area */}
+                {/* Interaction String */}
                 <div className="flex flex-col items-center mb-8">
                     <span className={`text-sarus-desc text-lg font-medium tracking-wide transition-colors duration-300 mb-6 ${isSpeaking ? 'text-sarus-red' : isAiSpeaking ? 'text-orange-500' : 'text-gray-500'}`}>
                         {isAiSpeaking ? 'Examiner is speaking...' : status}
                     </span>
-
-                    {/* Record Button */}
-                    {stage !== 'Evaluation' && (
-                        <div className="relative group cursor-pointer" onClick={handleToggle}>
-                            {!isSpeaking && status === 'Your Turn' && (
-                                <div className="absolute inset-0 rounded-full bg-sarus-red/10 animate-ping duration-[2s]"></div>
-                            )}
-                            <div className={`w-20 h-20 md:w-24 md:h-24 rounded-full flex items-center justify-center transition-all duration-300 shadow-xl ${isSpeaking ? 'bg-white border-4 border-gray-100 scale-100' : 'bg-sarus-red scale-110 shadow-sarus-red/30'}`}>
-                                <div className={`w-8 h-8 md:w-10 md:h-10 rounded-full transition-colors duration-300 ${isSpeaking ? 'bg-sarus-red animate-pulse' : 'bg-white'}`}></div>
-                            </div>
-                        </div>
-                    )}
                 </div>
-
             </div>
 
             {/* Visualizer & Transcript */}
@@ -396,7 +227,6 @@ function Evaluation() {
                 <div className="w-full h-full absolute inset-0">
                     <GeminiVisualizer />
                 </div>
-
                 <div className="relative w-full z-10 px-8 pb-12 text-center pointer-events-auto">
                     <div className="max-w-4xl mx-auto max-h-[20vh] overflow-y-auto pr-2 scrollbar-thin scrollbar-thumb-gray-400">
                         <p className="text-sarus-desc text-lg md:text-xl font-light italic opacity-80 leading-relaxed text-shadow-sm">
@@ -406,13 +236,7 @@ function Evaluation() {
                 </div>
             </div>
 
-            {/* Error Overlay */}
-            {error && (
-                <ErrorOverlay
-                    message={error}
-                    onRetry={() => setError(null)}
-                />
-            )}
+            {error && <ErrorOverlay message={error} onRetry={() => setError(null)} />}
 
             {/* Start Overlay */}
             {!testStarted && !error && (
@@ -433,7 +257,6 @@ function Evaluation() {
                     </div>
                 </div>
             )}
-
         </div>
     );
 }

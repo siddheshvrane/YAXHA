@@ -1,0 +1,1202 @@
+﻿diff --git a/backend/requirements.txt b/backend/requirements.txt
+index a2af427..0ec8fa1 100644
+--- a/backend/requirements.txt
++++ b/backend/requirements.txt
+@@ -2,6 +2,6 @@ faster-whisper
+ websockets
+ numpy
+ python-dotenv
+-google-generativeai
++ollama
+ fastapi
+ uvicorn
+diff --git a/backend/server.py b/backend/server.py
+index 3a4d81b..61d1133 100644
+--- a/backend/server.py
++++ b/backend/server.py
+@@ -2,24 +2,26 @@ import os
+ import logging
+ import json
+ import asyncio
+-import tempfile
+-import io
++import uuid
+ from dotenv import load_dotenv
+ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+ from fastapi.middleware.cors import CORSMiddleware
+-from faster_whisper import WhisperModel
+-from google import genai
+-from google.genai import types
+ 
+-# Load environment variables
+-load_dotenv()
++# --- Architecture ---
++from core_bus import bus
++from rag import RAGPipeline
++from memory import UserMemory
++
++# Initialize services (this registers all EventBus subscriptions)
++import services.transcription_service as t_service
++import services.llm_service as llm_service
++import services.tts_service as tts_service 
+ 
+-# Configure logging
++load_dotenv()
+ logging.basicConfig(level=logging.INFO)
+-logger = logging.getLogger("whisper-server")
++logger = logging.getLogger("api-gateway")
+ 
+ app = FastAPI()
+-
+ app.add_middleware(
+     CORSMiddleware,
+     allow_origins=["*"],
+@@ -28,322 +30,140 @@ app.add_middleware(
+     allow_headers=["*"],
+ )
+ 
+-# --- Configuration ---
+-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+-CLIENT = None
++# ---------------------------------------------------------------------------
++# Background Initialization & Model Warmup
++# ---------------------------------------------------------------------------
++rag: RAGPipeline | None = None
++user_mem: UserMemory | None = None
+ 
+-if not GEMINI_API_KEY:
+-    logger.warning("GEMINI_API_KEY not found in environment variables. Please set it for AI features.")
+-else:
++@app.on_event("startup")
++async def _startup_services():
++    global rag, user_mem
++    logger.info("Gateway Boot: Pre-loading dependencies in background...")
++    
++    # Pre-warm transcriber models
++    t_service.init_transcriber()
++    
++    # Init RAG & Memory
++    import ollama
++    OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
++    OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
++    embed_model = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
++    kb_path = str(__import__('pathlib').Path(__file__).parent / "knowledge_base")
++    
+     try:
+-        CLIENT = genai.Client(api_key=GEMINI_API_KEY)
++        _client = ollama.Client(host=OLLAMA_HOST)
++        _client.list()
++        rag = await asyncio.to_thread(RAGPipeline, kb_path, _client, embed_model)
++        user_mem = await asyncio.to_thread(UserMemory, _client, embed_model, OLLAMA_MODEL)
+     except Exception as e:
+-        logger.error(f"Failed to initialize Gemini Client: {e}")
+-
+-# Load Faster Whisper Model
+-model_size = "base.en" # Use English-optimized model for speed and accuracy
+-logger.info(f"Loading Faster Whisper model: {model_size}...")
+-try:
+-    audio_model = WhisperModel(model_size, device="cpu", compute_type="int8")
+-    logger.info("Whisper model loaded successfully!")
+-except Exception as e:
+-    logger.error(f"Error loading Whisper model: {e}")
+-    audio_model = None
+-
+-# --- IELTS Examiner Agent ---
+-
+-class IELTSExaminer:
+-    def __init__(self):
+-        self.stage = "Introduction"  # Introduction, CueCard, Discussion, Evaluation
+-        self.chat_history = []
+-        self.candidate_models = [
+-            "models/gemini-2.0-flash",
+-            "models/gemini-2.0-flash-lite",
+-            "models/gemini-2.5-flash",
+-            "models/gemini-flash-lite-latest",
+-            "models/gemini-flash-latest"
+-        ]
+-        self.current_model_index = 0
+-        self.model = self.candidate_models[self.current_model_index]
++        logger.error(f"Failed to load RAG/Memory vectors: {e}")
+         
+-        # System Prompt
+-        self.system_instructions = """
+-        You are Baka, a certified IELTS Speaking Examiner. Your job is to conduct a realistic IELTS Speaking test perfectly by prioritizing official standards.
+-        Your name is BAKA. Never call yourself Alex or anything else.
++    # Pre-warm LLM model to eliminate "First Start" delays
++    llm_service.init_llm(rag=rag, mem=user_mem)
+ 
+-        PRIORITIZATION & ACCURACY:
+-        - Always prioritize information tagged as [OFFICIAL SOURCE] in the `backend/knowledge_base/` directory.
+-        - Reference `backend/knowledge_base/sources.md` for a catalog of legitimate documentation.
+-        
+-        STRICT FORMATTING (CRITICAL):
+-        - USE PLAIN TEXT ONLY.
+-        - NEVER use bold (**), italics (*), or markdown headers (#).
+-        - NEVER use bullet points (-) or numbered lists. Use commas and full sentences instead.
+-        - NEVER use emojis or special symbols.
+-        - Your output must be pure speech-friendly text.
+-        
+-        STRICT TEST MOMENTUM:
+-        - After the user answers a question, IMMEDIATELY acknowledge it (briefly) and ask the NEXT question.
+-        - NEVER stop the conversation or wait for the user to prompt you to continue.
+-        - Keep the test moving according to the official parts.
+-
+-        STRICT TEST STRUCTURE:
+-        
+-        PART 1: Introduction & Interview (4-5 minutes)
+-        - Start with the official script: "Good morning/afternoon. My name is Baka. Can you please tell me your full name?"
+-        - Ask 3-4 personal questions about familiar topics (Home, Work, Studies, Hobbies).
+-        - One question at a time. After they answer, move to the next topic.
+-
+-        PART 2: Cue Card (Long Turn) (3-4 minutes)
+-        - Provide a Cue Card topic with 4 bullet points.
+-        - Use the official transition: "I'd like you to talk about it for one to two minutes. Before you speak, you have one minute to prepare."
+-        - Provide the topic and bullets immediately.
+-        - Once they finish their speech, ask 1-2 brief follow-up questions.
+-
+-        PART 3: Two-Way Discussion (4-5 minutes)
+-        - Transition using: "WeΓÇÖve been talking about [Topic]. IΓÇÖd like to discuss with you one or two more general questions relating to this."
+-        - Ask abstract, thematic questions. Probe deeper if answers are shallow.
++# ---------------------------------------------------------------------------
++# WebSocket Gateway Routers
++# ---------------------------------------------------------------------------
+ 
+-        FINAL EVALUATION:
+-        - When all parts are done, or if the user requests an evaluation, provide a Band Score (0-9).
+-        - Break down the score based on: 1. Fluency and Coherence, 2. Lexical Resource, 3. Grammatical Range and Accuracy, 4. Pronunciation.
+-        - Be objective and point out specific areas for improvement vs. strengths.
+-        """
++class ConnectionManager:
++    def __init__(self):
++        self.active_connections: dict[str, WebSocket] = {}
+ 
+-    async def generate_response(self, user_text: str, override_stage: str = None):
+-        if not CLIENT:
+-            return {"text": "AI Error: Gemini API Key missing or invalid.", "stage": "Error", "type": "error"}
++    def connect(self, ws_id: str, websocket: WebSocket):
++        self.active_connections[ws_id] = websocket
+ 
+-        try:
+-            # Context management
+-            context_wrapper = ""
+-            if override_stage:
+-                self.stage = override_stage
+-                if self.stage == "Introduction":
+-                    context_wrapper = "System: Start Part 1 (Introduction). Introduce yourself as Baka and ask for their full name."
+-                elif self.stage == "CueCard":
+-                    context_wrapper = "System: Start Part 2. Give the user a Cue Card topic with 4 bullet points. Tell them they have 1 minute to prep."
+-                elif self.stage == "Discussion":
+-                    context_wrapper = "System: Start Part 3 (Discussion). Ask abstract questions related to the previous topic."
+-                elif self.stage == "Evaluation":
+-                    context_wrapper = "System: The test is finished. Provide the Final Band Score (0-9) and detailed feedback."
+-            
+-            final_user_content = f"{context_wrapper}\nUser: {user_text}" if context_wrapper else user_text
+-            
+-            # Add user message to history (don't commit yet in case of retry)
+-            user_content = types.Content(role="user", parts=[types.Part.from_text(text=final_user_content)])
+-            
+-            # Retry logic for quota exhaustion
+-            for attempt in range(len(self.candidate_models)):
+-                try:
+-                    current_model = self.candidate_models[self.current_model_index]
+-                    logger.info(f"Attempting generation with model: {current_model}")
+-                    
+-                    response = await asyncio.to_thread(
+-                        CLIENT.models.generate_content,
+-                        model=current_model,
+-                        contents=self.chat_history + [user_content],
+-                        config=types.GenerateContentConfig(
+-                            system_instruction=self.system_instructions,
+-                            temperature=0.7
+-                        )
+-                    )
+-                    
+-                    ai_text = response.text
+-                    
+-                    # Auto-detect Stage Transitions if not overridden
+-                    if not override_stage:
+-                        upper_text = ai_text.upper()
+-                        # Be more aggressive in detecting Part 2 transition
+-                        if "PART 2" in upper_text or "CUE CARD" in upper_text or "ONE MINUTE TO PREPARE" in upper_text:
+-                            self.stage = "CueCard"
+-                        elif "PART 3" in upper_text or "DISCUSSION" in upper_text or "ONE OR TWO MORE GENERAL QUESTIONS" in upper_text:
+-                            self.stage = "Discussion"
+-                        elif "BAND SCORE" in upper_text or "EVALUATION" in upper_text or "THAT IS THE END OF THE TEST" in upper_text:
+-                            self.stage = "Evaluation"
++    def disconnect(self, ws_id: str):
++        if ws_id in self.active_connections:
++            del self.active_connections[ws_id]
+ 
+-                    # Success: Commit history
+-                    self.chat_history.append(user_content)
+-                    self.chat_history.append(types.Content(role="model", parts=[types.Part.from_text(text=ai_text)]))
+-                    
+-                    self.model = current_model # Persist successful model
+-                    return {
+-                        "text": ai_text,
+-                        "stage": self.stage,
+-                        "type": "response"
+-                    }
+-                    
+-                except Exception as e:
+-                    error_msg = str(e).upper()
+-                    if "404" in error_msg or "NOT_FOUND" in error_msg:
+-                        logger.warning(f"Model {current_model} not found/supported. Skipping...")
+-                        self.current_model_index = (self.current_model_index + 1) % len(self.candidate_models)
+-                        continue # Try next model
+-                    
+-                    if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
+-                        logger.warning(f"Model {current_model} exhausted. Switching...")
+-                        self.current_model_index = (self.current_model_index + 1) % len(self.candidate_models)
+-                        if attempt == len(self.candidate_models) - 1:
+-                            raise Exception("All available Gemini models have exhausted their quotas for today.")
+-                        continue # Try next model
+-                    
+-                    # For other errors, don't fallback immediately unless specified
+-                    raise e
++    async def send_to(self, ws_id: str, payload: dict):
++        if ws_id in self.active_connections:
++            try:
++                await self.active_connections[ws_id].send_text(json.dumps(payload))
++            except Exception as e:
++                logger.error(f"WebSocket send error to {ws_id}: {e}")
+ 
+-        except Exception as e:
+-            logger.error(f"Gemini generation error: {e}")
+-            return {
+-                "text": f"SYSTEM ERROR: {str(e)[:100]}", 
+-                "stage": self.stage, 
+-                "type": "error"
+-            }
++manager = ConnectionManager()
+ 
++# Subscribe Gateway to the Service Bus to route finished data back to UI
++async def route_llm_response(data: dict):
++    await manager.send_to(data.get("websocket_id"), {
++        "text": data.get("text"),
++        "stage": data.get("stage"),
++        "type": data.get("type", "response"),
++        "audio": data.get("audio")
++    })
+ 
+-session_examiner = IELTSExaminer()
++async def route_transcript_preview(data: dict):
++    # Only route preview text (not errors or stage changes)
++    if "is_error" not in data and "override_stage" not in data:
++        await manager.send_to(data.get("websocket_id"), {
++            "text": data.get("text"),
++            "type": "preview"
++        })
+ 
+-# EBML/WebM Header for validation
+-WEBM_HEADER = b'\x1a\x45\xdf\xa3'
++bus.subscribe("response_ready_to_transmit", route_llm_response)
++bus.subscribe("transcript_completed", route_transcript_preview)
+ 
+-def is_valid_webm(buffer: bytes) -> bool:
+-    """Checks if the buffer starts with a valid WebM header."""
+-    return buffer.startswith(WEBM_HEADER)
+ 
+ @app.websocket("/listen")
+ async def websocket_endpoint(websocket: WebSocket):
+     await websocket.accept()
+-    logger.info("WebSocket connected")
++    ws_id = str(uuid.uuid4())
++    manager.connect(ws_id, websocket)
++    logger.info(f"WebSocket Client Connected [{ws_id}]")
+     
+-    # Audio Buffer: Use memory instead of disk for stability on Windows
++    # We maintain a bytearray for incoming chunks
+     audio_buffer = bytearray()
+     
+-    current_transcript = ""
+-    transcription_lock = asyncio.Lock() # Prevent concurrent transcriptions
+-    last_preview_time = 0 # Throttle previews
+-
+     try:
+         while True:
+-            # Use receive() to handle both bytes (audio) and text (control)
+-            try:
+-                message = await websocket.receive()
+-            except RuntimeError as e:
+-                if "disconnect message has been received" in str(e):
+-                    logger.info("WebSocket already disconnected (received disconnect message).")
+-                    break
+-                raise e
+-
+-            if "bytes" in message:
+-                # Audio Chunk
+-                data = message["bytes"]
+-                audio_buffer.extend(data)
+-                
+-                # Preview Transcription - Non-blocking, Throttled, and Forced English
+-                current_time = asyncio.get_event_loop().time()
+-                if audio_model and not transcription_lock.locked() and (current_time - last_preview_time) > 1.2:
+-                    # Validate header before trying to transcribe
+-                    if not is_valid_webm(audio_buffer):
+-                        logger.warning("Corrupted audio buffer (missing header). Purging...")
+-                        audio_buffer.clear()
+-                        continue
+-
+-                    async with transcription_lock:
+-                        last_preview_time = current_time
+-                        try:
+-                            # Take a thread-safe snapshot
+-                            snapshot = bytes(audio_buffer)
+-                            audio_data = io.BytesIO(snapshot)
+-                            segments, _ = await asyncio.to_thread(
+-                                audio_model.transcribe, 
+-                                audio_data, 
+-                                beam_size=1, 
+-                                vad_filter=True,
+-                                language="en"
+-                            )
+-                            text = " ".join([s.text for s in segments]).strip()
+-                            if text:
+-                                current_transcript = text
+-                                await websocket.send_text(json.dumps({"text": text, "type": "preview"}))
+-                        except Exception as e:
+-                            # Silently ignore transcription errors for previews
+-                            pass
++            message = await websocket.receive()
+             
+-            elif "text" in message:
+-                # Control Signal
++            # 1. Routing Audio Bytes -> Transcription Service
++            if message.get("bytes"):
++                audio_buffer.extend(message["bytes"])
++                
++            # 2. Routing Text Signals -> LLM Service
++            elif message.get("text"):
+                 try:
+                     text_data = message["text"]
+-                    # Try to parse as JSON first
+-                    try:
+-                        payload = json.loads(text_data)
+-                        signal = payload.get("text", "")
+-                    except json.JSONDecodeError:
+-                        signal = text_data
++                    payload = json.loads(text_data) if text_data.startswith("{") else {"text": text_data}
++                    signal = payload.get("text", "")
+                     
+                     if signal == "COMMIT":
+-                        # Final Transcription
+-                        if not audio_buffer or not is_valid_webm(audio_buffer):
+-                            logger.warning("Empty or invalid buffer on COMMIT. Skipping transcription.")
+-                            audio_buffer.clear()
+-                            continue
+-
+-                        async with transcription_lock:
+-                            # Take a safe snapshot before clearing
+-                            snapshot = bytes(audio_buffer)
+-                            audio_buffer.clear()
+-                            audio_data = io.BytesIO(snapshot)
+-                            
+-                            try:
+-                                segments, _ = await asyncio.to_thread(
+-                                    audio_model.transcribe, 
+-                                    audio_data, 
+-                                    beam_size=1, 
+-                                    vad_filter=True,
+-                                    language="en"
+-                                )
+-                                final_text = " ".join([s.text for s in segments]).strip()
+-                                current_transcript = ""
+-                                
+-                                # Generate AI Response
+-                                logger.info(f"User said: {final_text}")
+-                                ai_resp = await session_examiner.generate_response(final_text)
+-                                
+-                                # Send back
+-                                await websocket.send_text(json.dumps({
+-                                    "text": ai_resp["text"], 
+-                                    "stage": ai_resp["stage"], 
+-                                    "type": "response"
+-                                }))
+-                            except Exception as e:
+-                                logger.error(f"COMMIT transcription error: {e}")
+-                                await websocket.send_text(json.dumps({
+-                                    "text": "SYSTEM: I couldn't hear that clearly. Could you repeat?", 
+-                                    "stage": session_examiner.stage,
+-                                    "type": "response"
+-                                }))
+-                    
++                        # Push the finalized WebM audio chunk to the Transcriber Bus
++                        await bus.publish("audio_received", {
++                            "websocket_id": ws_id,
++                            "audio_bytes": bytes(audio_buffer)
++                        })
++                        audio_buffer.clear()
++                        
+                     elif signal.startswith("STAGE_CHANGE:"):
+-                        # Force stage change
+                         new_stage = signal.split(":")[1]
+-                        logger.info(f"Forcing stage: {new_stage}")
+-                        ai_resp = await session_examiner.generate_response(f"System: Transition to {new_stage}", override_stage=new_stage)
+-                        await websocket.send_text(json.dumps({
+-                            "text": ai_resp["text"], 
+-                            "stage": ai_resp["stage"], 
+-                            "type": ai_resp["type"]
+-                        }))
+-                    
++                        await bus.publish("ui_action_event", {
++                            "websocket_id": ws_id,
++                            "override_stage": new_stage,
++                            "text": f"System: Transition to {new_stage}"
++                        })
++                        
+                     elif signal == "START_EXAM":
+-                        # Triggered by user gesture on frontend
+-                        logger.info("User started exam. Generating initial greeting...")
+-                        ai_resp = await session_examiner.generate_response("", override_stage="Introduction")
+-                        await websocket.send_text(json.dumps({
+-                            "text": ai_resp["text"], 
+-                            "stage": ai_resp["stage"], 
+-                            "type": ai_resp["type"]
+-                        }))
++                        await bus.publish("ui_action_event", {
++                            "websocket_id": ws_id,
++                            "override_stage": "Introduction",
++                            "text": "User started the test."
++                        })
++                        
+                 except Exception as e:
+-                    logger.error(f"Error handling text signal: {e}")
+-
++                    logger.error(f"Event routing error: {e}")
++                    
++    except WebSocketDisconnect:
++        manager.disconnect(ws_id)
++        logger.info(f"WebSocket Client Disconnected [{ws_id}]")
+     except Exception as e:
+-        logger.error(f"Error: {e}")
++        manager.disconnect(ws_id)
++        logger.error(f"Endpoint Error: {e}")
+     finally:
+         audio_buffer.clear()
+ 
+diff --git a/src/pages/Evaluation.jsx b/src/pages/Evaluation.jsx
+index 54afddf..9ede9f5 100644
+--- a/src/pages/Evaluation.jsx
++++ b/src/pages/Evaluation.jsx
+@@ -1,115 +1,62 @@
+-import React, { useState, useEffect, useRef } from 'react';
++import React, { useState, useEffect } from 'react';
+ import { Link } from 'react-router-dom';
+ import GeminiVisualizer from '../components/GeminiVisualizer';
+ import ErrorOverlay from '../components/ErrorOverlay';
+ import craneAgent from '../assets/Crane AI Agent.png';
++
++// --- Decoupled RxJS Services ---
+ import { examineeService } from '../services/examineeService';
++import { audioService } from '../services/audioService';
+ 
+ function Evaluation() {
+-    // --- State ---
+-    const [stage, setStage] = useState('Introduction'); // Introduction, CueCard, Discussion, Evaluation
+-    const [status, setStatus] = useState('Wait'); // 'Wait', 'Your Turn', 'Prep', 'Speaking'
+-    const [isSpeaking, setIsSpeaking] = useState(false); // User is recording
+-    const [isAiSpeaking, setIsAiSpeaking] = useState(false); // AI is speaking
+-    const [testStarted, setTestStarted] = useState(false); // User clicked 'Start'
+-    const [error, setError] = useState(null); // Quota or system errors
+-    const [cueCardWaiting, setCueCardWaiting] = useState(false); // Transition state for Part 2
+-
++    // --- UI State (Synced strictly via RxJS Observables) ---
++    const [stage, setStage] = useState('Introduction'); 
++    const [status, setStatus] = useState('Wait'); 
++    const [isSpeaking, setIsSpeaking] = useState(false); // User recording state
++    const [isAiSpeaking, setIsAiSpeaking] = useState(false); 
++    const [testStarted, setTestStarted] = useState(false); 
++    const [error, setError] = useState(null); 
++    
+     // Content state
+-    const [aiQuestion, setAiQuestion] = useState("Connecting to IELTS Examiner...");
++    const [aiQuestion, setAiQuestion] = useState("Connected. Waiting for Examiner...");
+     const [userTranscript, setUserTranscript] = useState("");
+ 
+     // Timers for Part 2
+-    const [prepTimeLeft, setPrepTimeLeft] = useState(60); // 1 minute
+-    const [speakingSeconds, setSpeakingSeconds] = useState(0); // Count up
++    const [prepTimeLeft, setPrepTimeLeft] = useState(60); 
++    const [speakingSeconds, setSpeakingSeconds] = useState(0); 
+     const [isPrepActive, setIsPrepActive] = useState(false);
+     const [isRecordTimerActive, setIsRecordTimerActive] = useState(false);
+ 
+-    // Refs
+-    const websocketRef = useRef(null);
+-    const mediaRecorderRef = useRef(null);
+-    const mediaStreamRef = useRef(null);
+-    const audioContextRef = useRef(null);
+-    const analyserRef = useRef(null);
+-    const dataArrayRef = useRef(null);
+-    const sourceRef = useRef(null);
+-    const rafIdRef = useRef(null);
+-
+-    // --- RxJS Subscriptions ---
++    // --- Core RxJS Subscriptions ---
+     useEffect(() => {
+         const subs = [
+             examineeService.status$.subscribe(setStatus),
++            examineeService.stage$.subscribe(newStage => {
++                setStage(newStage);
++            }),
+             examineeService.aiResponse$.subscribe(resp => {
+-                if (resp.type === 'response') {
+-                    setAiQuestion(resp.text);
+-                    setStage(resp.stage);
+-                    if (resp.stage === 'CueCard') startCueCardPhase();
+-                    else if (resp.stage === 'Evaluation') setStatus('Exam Finished');
+-                    else setStatus('Your Turn');
+-                } else if (resp.type === 'error') {
+-                    setError(resp.text);
+-                }
++                if (resp && resp.type === 'response') setAiQuestion(resp.text);
+             }),
+             examineeService.userTranscript$.subscribe(setUserTranscript),
+-            examineeService.audioData$.subscribe(data => {
+-                // This component doesn't need to store audioData locally anymore,
+-                // but it subscribes to ensure the service is active.
+-                // The GeminiVisualizer will subscribe directly.
+-            }),
+-            examineeService.isAiSpeaking$.subscribe(setIsAiSpeaking)
++            examineeService.isAiSpeaking$.subscribe(setIsAiSpeaking),
++            
++            // Map Audio service directly to UI
++            audioService.isRecording$.subscribe(setIsSpeaking),
++            audioService.microphoneError$.subscribe(setError)
+         ];
+-
++        
+         return () => subs.forEach(s => s.unsubscribe());
+-    }, []);
+-
+-    // --- WebSocket Connection ---
+-    useEffect(() => {
+-        let timeoutId;
+-        const connectWrapper = () => {
+-            const ws = new WebSocket("ws://localhost:8000/listen");
+-            websocketRef.current = ws;
+-
+-            ws.onopen = () => {
+-                console.log("WebSocket Connected");
+-                setAiQuestion("Connected. Waiting for Examiner...");
+-            };
++    }, [isPrepActive, speakingSeconds, prepTimeLeft]);
+ 
+-            ws.onmessage = (event) => {
+-                try {
+-                    const data = JSON.parse(event.data);
+-                    if (data.type === 'preview') {
+-                        examineeService.updateTranscript(data.text);
+-                    } else {
+-                        examineeService.emitResponse(data);
+-                    }
+-                } catch (e) {
+-                    console.error("WS parse error:", e);
+-                }
+-            };
+-            ws.onerror = () => setAiQuestion("Connection Error. Is the backend running?");
+-        };
+-        timeoutId = setTimeout(connectWrapper, 100);
+-        return () => {
+-            clearTimeout(timeoutId);
+-            if (websocketRef.current) websocketRef.current.close();
+-        };
+-    }, []);
+-
+-    // --- Part 2 Timers ---
+-
+-    const startCueCardPhase = () => {
+-        setCueCardWaiting(true);
+-    };
+-
+-    // Effect to trigger Part 2 Prep only after AI stops talking
++    // --- Part 2 Cue Card Timer Orchestration ---
+     useEffect(() => {
+-        if (stage === 'CueCard' && cueCardWaiting && !isAiSpeaking) {
++        if (stage === 'CueCard' && !isAiSpeaking && prepTimeLeft === 60 && speakingSeconds === 0 && !isPrepActive && !isRecordTimerActive) {
++            // Wait for AI to finish dictating instructions before starting the Prep countdown
+             setStatus('Prep Time');
+             setIsPrepActive(true);
+-            setPrepTimeLeft(60);
+-            setCueCardWaiting(false);
++            audioService.setPrepActive(true);
+         }
+-    }, [isAiSpeaking, stage, cueCardWaiting]);
++    }, [stage, isAiSpeaking, prepTimeLeft, speakingSeconds, isPrepActive, isRecordTimerActive]);
+ 
+     useEffect(() => {
+         let interval = null;
+@@ -118,11 +65,11 @@ function Evaluation() {
+                 setPrepTimeLeft(prev => prev - 1);
+             }, 1000);
+         } else if (isPrepActive && prepTimeLeft === 0) {
+-            // Prep Finished -> Start Recording
++            // Prep Finished -> Force Start Recording
+             setIsPrepActive(false);
+-            startRecordingTurn(); // Auto start recording
++            audioService.setPrepActive(false);
++            examineeService.resumeUserTurn(); // Tells service to kick on the mic
+             setIsRecordTimerActive(true);
+-            setRecordTimeLeft(120);
+             setStatus('Speaking Time');
+         }
+         return () => clearInterval(interval);
+@@ -130,22 +77,32 @@ function Evaluation() {
+ 
+     useEffect(() => {
+         let interval = null;
+-        if (isRecordTimerActive) {
++        if (isRecordTimerActive && isSpeaking) {
+             interval = setInterval(() => {
+-                setSpeakingSeconds(prev => prev + 1);
+-            }, 1000);
+-        }
++                setSpeakingSeconds(prev => {
++                    const next = prev + 1;
++                    
++                    if (stage === 'CueCard') {
++                        if (next < 120) {
++                            audioService.setVadActive(false); // Force keep listening
++                        } else {
++                            audioService.setVadActive(true); // Allow VAD to cut
++                        }
++                    }
+ 
+-        // Hard stop at 3 minutes (180 seconds)
+-        if (speakingSeconds >= 180) {
+-            setIsRecordTimerActive(false);
+-            stopRecordingTurn(true);
++                    if (next >= 180) { // Hard limit at 3 mins
++                        setIsRecordTimerActive(false);
++                        audioService.stopRecordingTurn();
++                        examineeService.forceStageChange("Discussion"); 
++                    }
++                    return next;
++                });
++            }, 1000);
+         }
+-
+         return () => clearInterval(interval);
+-    }, [isRecordTimerActive, speakingSeconds]);
++    }, [isRecordTimerActive, speakingSeconds, isSpeaking]);
+ 
+-    // Dynamic Status for Part 2 Speaking
++    // Dynamic Status text for Part 2
+     useEffect(() => {
+         if (stage === 'CueCard' && isSpeaking) {
+             if (isPrepActive) {
+@@ -163,143 +120,12 @@ function Evaluation() {
+     }, [speakingSeconds, stage, isSpeaking, isPrepActive, prepTimeLeft]);
+ 
+ 
+-    // --- Audio Logic ---
+-
+-    const startRecordingTurn = async () => {
+-        if (isSpeaking) return;
+-
+-        try {
+-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+-            mediaStreamRef.current = stream;
+-            startAudioAnalysis(stream);
+-
+-            mediaRecorderRef.current = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
+-
+-            mediaRecorderRef.current.ondataavailable = (event) => {
+-                if (event.data.size > 0 && websocketRef.current?.readyState === WebSocket.OPEN) {
+-                    websocketRef.current.send(event.data);
+-                }
+-            };
+-
+-            // Synchronization logic: Send COMMIT only AFTER the last chunk is sent
+-            mediaRecorderRef.current.onstop = () => {
+-                if (websocketRef.current?.readyState === WebSocket.OPEN) {
+-                    // Critical: COMMIT must be sent AFTER dataavailable has fired for the last time
+-                    setTimeout(() => {
+-                        websocketRef.current.send(JSON.stringify({ text: "COMMIT" }));
+-                    }, 50);
+-                }
+-            };
+-
+-            mediaRecorderRef.current.start(250);
+-            setIsSpeaking(true);
+-
+-            if (stage === 'CueCard') {
+-                setIsRecordTimerActive(true);
+-                setSpeakingSeconds(0);
+-            } else {
+-                examineeService.setStatus('Recording...');
+-            }
+-            examineeService.updateTranscript("");
+-
+-        } catch (err) {
+-            console.error("Mic error:", err);
+-            examineeService.setStatus("Mic Error");
+-        }
+-    };
+-
+-    const stopRecordingTurn = (forceNextStage = false) => {
+-        if (!isSpeaking && !forceNextStage) return;
+-
+-        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+-            mediaRecorderRef.current.stop();
+-        }
+-
+-        stopAudioAnalysis();
+-        if (mediaStreamRef.current) {
+-            mediaStreamRef.current.getTracks().forEach(track => track.stop());
+-            mediaStreamRef.current = null;
+-        }
+-
+-        setIsSpeaking(false);
+-        examineeService.setStatus('Wait');
+-
+-        // Logic for forced transitions (timers)
+-        if (forceNextStage && websocketRef.current?.readyState === WebSocket.OPEN) {
+-            if (stage === 'CueCard') {
+-                websocketRef.current.send(JSON.stringify({ text: "STAGE_CHANGE:Discussion" }));
+-            }
+-        }
+-    };
+-
+-    const handleToggle = () => {
+-        if (stage === 'Evaluation') return;
+-        if (isPrepActive) return;
+-
+-        if (isSpeaking) {
+-            // Part 2 constraints: Cannot stop before 2 minutes
+-            if (stage === 'CueCard' && speakingSeconds < 120) {
+-                alert("Please continue speaking. You need to talk for at least 2 minutes for Part 2.");
+-                return;
+-            }
+-            stopRecordingTurn();
+-        } else {
+-            startRecordingTurn();
+-        }
+-    };
+-
+-    const handleStartExam = () => {
+-        if (websocketRef.current?.readyState === WebSocket.OPEN) {
+-            setTestStarted(true);
+-            websocketRef.current.send(JSON.stringify({ text: "START_EXAM" }));
+-            // Unlock speech synthesis by playing an empty utterance
+-            examineeService.unlockSpeechSynthesis();
+-        } else {
+-            setAiQuestion("Still connecting... please wait.");
+-        }
+-    };
+-
+-    // --- Helpers ---
+-    const startAudioAnalysis = (stream) => {
+-        if (!audioContextRef.current) audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+-        if (audioContextRef.current.state === 'suspended') audioContextRef.current.resume();
+-
+-        analyserRef.current = audioContextRef.current.createAnalyser();
+-        analyserRef.current.fftSize = 512;
+-        dataArrayRef.current = new Uint8Array(analyserRef.current.frequencyBinCount);
+-
+-        sourceRef.current = audioContextRef.current.createMediaStreamSource(stream);
+-        sourceRef.current.connect(analyserRef.current);
+-
+-        const update = () => {
+-            if (analyserRef.current) {
+-                analyserRef.current.getByteFrequencyData(dataArrayRef.current);
+-                // Calculate simple averages for low/mid/high
+-                const length = dataArrayRef.current.length;
+-                const lowAvg = dataArrayRef.current.slice(0, Math.floor(length * 0.1)).reduce((a, b) => a + b, 0) / (length * 0.1) || 0;
+-                const midAvg = dataArrayRef.current.slice(Math.floor(length * 0.1), Math.floor(length * 0.5)).reduce((a, b) => a + b, 0) / (length * 0.4) || 0;
+-                const highAvg = dataArrayRef.current.slice(Math.floor(length * 0.5)).reduce((a, b) => a + b, 0) / (length * 0.5) || 0;
+-
+-                // Update service's audio stream
+-                examineeService.updateAudioData({
+-                    low: lowAvg / 255,
+-                    mid: midAvg / 255,
+-                    high: highAvg / 255
+-                });
+-            }
+-            rafIdRef.current = requestAnimationFrame(update);
+-        };
+-        update();
++    // --- Boot ---
++    const handleStartExam = async () => {
++        setTestStarted(true);
++        await examineeService.startExamination();
+     };
+ 
+-    const stopAudioAnalysis = () => {
+-        if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current);
+-        examineeService.updateAudioData({ low: 0, mid: 0, high: 0 }); // Reset audio data in service
+-    };
+-
+-    // --- Render ---
+-
+-    // Format Phase Name
+     const getStageName = () => {
+         switch (stage) {
+             case 'Introduction': return 'Stage 1: Introduction';
+@@ -310,6 +136,26 @@ function Evaluation() {
+         }
+     };
+ 
++    const renderCueCardContent = (text) => {
++        if (!text.includes('ΓÇó')) return <div className="text-lg md:text-xl font-medium">{text}</div>;
++        
++        const parts = text.split('ΓÇó');
++        const header = parts[0].trim();
++        const bullets = parts.slice(1).map((b, i) => (
++            <li key={i} className="ml-6 list-disc marker:text-sarus-red mb-2 text-slate-700 font-medium">{b.trim()}</li>
++        ));
++
++        return (
++            <div className="bg-white border-2 border-slate-200 shadow-lg rounded-2xl p-6 md:p-8 my-4 relative animate-in fade-in slide-in-from-bottom-4 duration-700">
++                 <div className="absolute top-0 right-8 -mt-3 bg-white px-3 border border-slate-100 rounded-full shadow-sm text-xs font-bold text-slate-400 uppercase tracking-widest">Candidate Task Card</div>
++                 <p className="font-bold text-slate-800 text-xl mb-6">{header.replace(/TOPIC:/i, '').trim()}</p>
++                 <ul className="text-base md:text-lg space-y-3">
++                     {bullets}
++                 </ul>
++            </div>
++        );
++    };
++
+     return (
+         <div className="min-h-screen bg-sarus-body flex flex-col items-center justify-between relative overflow-hidden font-sans">
+ 
+@@ -325,7 +171,7 @@ function Evaluation() {
+             {/* Main Content */}
+             <div className="flex-1 w-full max-w-6xl mx-auto flex flex-col items-center justify-center px-4 relative z-10 block-content pt-20">
+ 
+-                {/* Question / Response Card */}
++                {/* Card */}
+                 <div className={`w-full max-w-4xl bg-gray-100/90 rounded-3xl p-8 md:p-12 shadow-sm backdrop-blur-md mb-8 transition-all duration-500 border-2 flex flex-col md:flex-row items-start gap-8 ${isSpeaking ? 'border-sarus-red/50 shadow-[0_0_30px_rgba(220,38,38,0.2)]' : 'border-transparent'}`}>
+ 
+                     {/* Avatar */}
+@@ -342,9 +188,7 @@ function Evaluation() {
+                         {stage === 'CueCard' ? (
+                             <div className="space-y-4">
+                                 <h3 className="text-xs font-bold text-gray-500 uppercase tracking-widest">Your Topic</h3>
+-                                <div className="text-lg md:text-xl font-medium text-evaluate-text leading-relaxed whitespace-pre-wrap">
+-                                    {aiQuestion}
+-                                </div>
++                                {renderCueCardContent(aiQuestion)}
+                                 <div className="flex gap-4 pt-4 border-t border-gray-200 mt-4">
+                                     {isPrepActive ? (
+                                         <div className="flex items-center gap-2">
+@@ -370,25 +214,12 @@ function Evaluation() {
+                     </div>
+                 </div>
+ 
+-                {/* Interaction Area */}
++                {/* Interaction String */}
+                 <div className="flex flex-col items-center mb-8">
+                     <span className={`text-sarus-desc text-lg font-medium tracking-wide transition-colors duration-300 mb-6 ${isSpeaking ? 'text-sarus-red' : isAiSpeaking ? 'text-orange-500' : 'text-gray-500'}`}>
+                         {isAiSpeaking ? 'Examiner is speaking...' : status}
+                     </span>
+-
+-                    {/* Record Button */}
+-                    {stage !== 'Evaluation' && (
+-                        <div className="relative group cursor-pointer" onClick={handleToggle}>
+-                            {!isSpeaking && status === 'Your Turn' && (
+-                                <div className="absolute inset-0 rounded-full bg-sarus-red/10 animate-ping duration-[2s]"></div>
+-                            )}
+-                            <div className={`w-20 h-20 md:w-24 md:h-24 rounded-full flex items-center justify-center transition-all duration-300 shadow-xl ${isSpeaking ? 'bg-white border-4 border-gray-100 scale-100' : 'bg-sarus-red scale-110 shadow-sarus-red/30'}`}>
+-                                <div className={`w-8 h-8 md:w-10 md:h-10 rounded-full transition-colors duration-300 ${isSpeaking ? 'bg-sarus-red animate-pulse' : 'bg-white'}`}></div>
+-                            </div>
+-                        </div>
+-                    )}
+                 </div>
+-
+             </div>
+ 
+             {/* Visualizer & Transcript */}
+@@ -396,7 +227,6 @@ function Evaluation() {
+                 <div className="w-full h-full absolute inset-0">
+                     <GeminiVisualizer />
+                 </div>
+-
+                 <div className="relative w-full z-10 px-8 pb-12 text-center pointer-events-auto">
+                     <div className="max-w-4xl mx-auto max-h-[20vh] overflow-y-auto pr-2 scrollbar-thin scrollbar-thumb-gray-400">
+                         <p className="text-sarus-desc text-lg md:text-xl font-light italic opacity-80 leading-relaxed text-shadow-sm">
+@@ -406,13 +236,7 @@ function Evaluation() {
+                 </div>
+             </div>
+ 
+-            {/* Error Overlay */}
+-            {error && (
+-                <ErrorOverlay
+-                    message={error}
+-                    onRetry={() => setError(null)}
+-                />
+-            )}
++            {error && <ErrorOverlay message={error} onRetry={() => setError(null)} />}
+ 
+             {/* Start Overlay */}
+             {!testStarted && !error && (
+@@ -433,7 +257,6 @@ function Evaluation() {
+                     </div>
+                 </div>
+             )}
+-
+         </div>
+     );
+ }
+diff --git a/src/services/examineeService.js b/src/services/examineeService.js
+index be3ab9f..ef02c73 100644
+--- a/src/services/examineeService.js
++++ b/src/services/examineeService.js
+@@ -1,135 +1,136 @@
+ import { Subject, BehaviorSubject } from 'rxjs';
++import { websocketService } from './websocketService.js';
++import { audioService } from './audioService.js';
+ 
+-/**
+- * Service to handle reactive communication between IELTS components.
+- * This decouples the UI from the underlying WebSocket/Audio logic.
+- */
+ class ExamineeService {
+     constructor() {
+-        // Observables for state
++        // Core Logic State
+         this.status$ = new BehaviorSubject('Wait');
+         this.stage$ = new BehaviorSubject('Introduction');
+-        this.aiResponse$ = new Subject(); // { text: string, type: 'response' | 'error' }
+         this.userTranscript$ = new BehaviorSubject('');
+-        this.audioData$ = new BehaviorSubject({ low: 0, mid: 0, high: 0 });
+         this.isAiSpeaking$ = new BehaviorSubject(false);
+-        this.isUserRecording$ = new BehaviorSubject(false);
+-
+-        // Signals
+-        this.controlSignal$ = new Subject(); // 'START_EXAM', 'COMMIT', etc.
+-
+-        // Shared Speech Synth
+-        this.synth = window.speechSynthesis;
++        this.examFinished$ = new BehaviorSubject(false);
++        this.aiResponse$ = new Subject();
++        
++        // The UI can bind directly to audio service levels
++        this.audioData$ = audioService.audioLevels$;
++        
++        // Fallback sim for AI visuals
+         this.aiSpeechInterval = null;
+ 
+-        // Prime voices immediately for better reactivity
+-        if (this.synth.onvoiceschanged !== undefined) {
+-            this.synth.onvoiceschanged = () => this.synth.getVoices();
+-        }
+-    }
+-
+-    emitResponse(response) {
+-        this.aiResponse$.next(response);
+-        // Automatic reactive speech
+-        if (response && response.type === 'response' && response.text) {
+-            this.speak(response.text);
+-        }
+-    }
+-
+-    setStatus(status) {
+-        this.status$.next(status);
+-        if (status === 'Recording...') this.isUserRecording$.next(true);
+-        else if (status === 'Wait' || status === 'Your Turn') this.isUserRecording$.next(false);
+-    }
+-
+-    setStage(stage) {
+-        this.stage$.next(stage);
+-    }
+-
+-    updateTranscript(text) {
+-        this.userTranscript$.next(text);
++        // --- Bind Microservices ---
++        
++        // Dynamically adjust VAD timeout based on Stage
++        this.stage$.subscribe(newStage => {
++            if (newStage === 'CueCard') audioService.setVadTimeout(5000); // Allow long pauses in Part 2
++            else audioService.setVadTimeout(1500); // Fast cutoff in conversational Parts 1 & 3
++        });
++        
++        // 1. When websocket receives data, update state
++        websocketService.messageReceived$.subscribe((data) => this._handleServerMessage(data));
++        
++        // 2. When VAD automatically cuts the mic, tell UI we are thinking
++        audioService.vadTriggered$.subscribe(() => {
++            if (this.status$.value !== 'Exam Finished') {
++                this.setStatus('Thinking...');
++            }
++        });
+     }
+ 
+-    updateAudioData(data) {
+-        this.audioData$.next(data);
++    async startExamination() {
++        await audioService.initMicrophone();
++        websocketService.connect();
++        
++        // Wait for connection
++        const sub = websocketService.isConnected$.subscribe(connected => {
++            if (connected) {
++                websocketService.sendJSON({ text: "START_EXAM" });
++                sub.unsubscribe();
++            }
++        });
+     }
+ 
+-    sendSignal(signal) {
+-        this.controlSignal$.next(signal);
++    // Called automatically or manually after AI finishes speaking
++    resumeUserTurn() {
++        if (this.status$.value === 'Exam Finished') return;
++        this.setStatus('Your Turn');
++        this.userTranscript$.next("");
++        audioService.startRecordingTurn();
+     }
+ 
+-    // --- AI Speech logic moved to Service ---
+-    sanitizeTTS(text) {
+-        if (!text) return "";
+-        return text
+-            .replace(/\*/g, "") // Remove asterisks (bold/italic)
+-            .replace(/#/g, "")  // Remove hashes
+-            .replace(/-/g, " ") // Replace dashes with spaces for flow
+-            .replace(/\s+/g, " ") // Collapse multiple spaces
+-            .replace(/[^\x00-\x7F]/g, "") // Remove non-ASCII (emojis, special chars)
+-            .trim();
++    forceStageChange(stageName) {
++        websocketService.sendJSON({ text: `STAGE_CHANGE:${stageName}` });
+     }
+ 
+-    speak(text) {
+-        if (!this.synth) return;
+-
+-        // Stabilize: Cancel and wait a tiny bit to stop previous "harsh" buffers
+-        this.synth.cancel();
+-
+-        const cleanText = this.sanitizeTTS(text);
+-        if (!cleanText) return;
+-
+-        const utterance = new SpeechSynthesisUtterance(cleanText);
+-
+-        const setVoice = () => {
+-            const voices = this.synth.getVoices();
+-            if (voices.length > 0) {
+-                const preferredVoice = voices.find(v => v.lang.includes('en-GB') || v.name.includes('Google UK English')) ||
+-                    voices.find(v => v.lang.includes('en-US')) ||
+-                    voices[0];
+-                if (preferredVoice) utterance.voice = preferredVoice;
+-
+-                utterance.rate = 1.0;
+-                utterance.pitch = 1.0;
+-                utterance.volume = 0.9; // Slightly lower than max to prevent clipping/harshness
+-
+-                utterance.onstart = () => {
+-                    this.isAiSpeaking$.next(true);
+-                    this.startAiVisualizerSim();
+-                };
+-
+-                utterance.onend = () => {
+-                    this.isAiSpeaking$.next(false);
+-                    this.stopAiVisualizerSim();
+-                };
+-
+-                utterance.onerror = () => {
+-                    this.isAiSpeaking$.next(false);
+-                    this.stopAiVisualizerSim();
+-                };
+-
+-                // Use a tiny timeout to ensure the previous synth.cancel() has fully cleared the hardware buffer
+-                setTimeout(() => {
+-                    this.synth.speak(utterance);
+-                }, 100);
++    _handleServerMessage(data) {
++        if (data.type === "preview") {
++            this.userTranscript$.next(data.text);
++        } else if (data.type === "response") {
++            this.aiResponse$.next(data);
++            // Update stage if it changed
++            if (data.stage) this.stage$.next(data.stage);
++            
++            // Set status to AI turn
++            if (data.stage === 'Evaluation') {
++                this.setStatus('Exam Finished');
++                this.examFinished$.next(true);
+             } else {
+-                setTimeout(setVoice, 100);
++                this.setStatus('Examiner is speaking...');
++            }
++            
++            // Play Edge-TTS Audio
++            if (data.audio) {
++                this.playAudioBase64(data.audio);
+             }
+-        };
+-        setVoice();
++        } else if (data.type === "error") {
++             console.error("Backend Error:", data.text);
++             this.setStatus('Error');
++        }
+     }
+ 
+-    unlockSpeechSynthesis() {
+-        if (this.synth) {
+-            const dummy = new SpeechSynthesisUtterance("");
+-            this.synth.speak(dummy);
++    // --- AI Speech logic mapped to Edge-TTS Base64 ---
++    playAudioBase64(base64Str) {
++        if (!base64Str) return;
++        try {
++            const audioSrc = `data:audio/mp3;base64,${base64Str}`;
++            const audio = new Audio(audioSrc);
++            
++            audio.onplay = () => {
++                this.isAiSpeaking$.next(true);
++                this.startAiVisualizerSim();
++            };
++            
++            audio.onended = () => {
++                this.isAiSpeaking$.next(false);
++                this.stopAiVisualizerSim();
++                // When AI is done, automatically start recording unless doing Eval or CueCard Prep
++                if (this.stage$.value !== 'Evaluation' && this.stage$.value !== 'CueCard') {
++                   setTimeout(() => this.resumeUserTurn(), 300);
++                }
++            };
++            
++            audio.onerror = (e) => {
++                console.error("Audio playback error", e);
++                this.isAiSpeaking$.next(false);
++                this.stopAiVisualizerSim();
++                if (this.stage$.value !== 'Evaluation' && this.stage$.value !== 'CueCard') {
++                   setTimeout(() => this.resumeUserTurn(), 300);
++                }
++            };
++            
++            audio.play().catch(e => {
++                console.error("Audio auto-play blocked by browser. User must interact.", e);
++            });
++        } catch (e) {
++            console.error("Failed to decode base64 audio", e);
+         }
+     }
+ 
+     startAiVisualizerSim() {
+         if (this.aiSpeechInterval) clearInterval(this.aiSpeechInterval);
+         this.aiSpeechInterval = setInterval(() => {
+-            this.updateAudioData({
++            // Overwrite audioLevels$ with fake AI waveform
++            audioService.audioLevels$.next({
+                 low: 0.2 + Math.random() * 0.4,
+                 mid: 0.1 + Math.random() * 0.3,
+                 high: Math.random() * 0.2
+@@ -142,10 +143,11 @@ class ExamineeService {
+             clearInterval(this.aiSpeechInterval);
+             this.aiSpeechInterval = null;
+         }
+-        // Only reset if not user recording
+-        if (!this.isUserRecording$.value) {
+-            this.updateAudioData({ low: 0, mid: 0, high: 0 });
+-        }
++        audioService.audioLevels$.next({ low: 0, mid: 0, high: 0 });
++    }
++
++    setStatus(statusStr) {
++        this.status$.next(statusStr);
+     }
+ }
+ 

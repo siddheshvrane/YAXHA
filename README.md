@@ -9,7 +9,7 @@
   [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
   [![React](https://img.shields.io/badge/Frontend-React%2019-blue?logo=react)](https://react.dev/)
   [![FastAPI](https://img.shields.io/badge/Backend-FastAPI-green?logo=fastapi)](https://fastapi.tiangolo.com/)
-  [![Gemini](https://img.shields.io/badge/AI-Gemini%202.0%20Flash-red?logo=googlegemini)](https://deepmind.google/technologies/gemini/)
+  [![Ollama](https://img.shields.io/badge/AI-Ollama%20Llama%203-blue?logo=ollama)](https://ollama.com/)
 </div>
 
 ---
@@ -36,9 +36,10 @@
 
 ### Backend (The AI Engine)
 - **FastAPI**: High-performance Python web framework for handling WebSocket-based audio streaming.
-- **Gemini 2.0 Flash**: Powers the examiner logic with high intelligence and extremely low latency.
+- **Event-Driven Microservices**: Decoupled architecture utilizing an internal Service Bus (`core_bus.py`) for routing events between LLM, TTS, and Transcription services.
+- **Local AI (Ollama)**: Powers the examiner logic using local Llama 3 models for enhanced privacy and no API costs.
 - **Faster-Whisper**: Local, optimized speech-to-text transcription utilizing the CTranslate2 engine for speed and privacy.
-- **Knowledge Base (RAG)**: A curated repository of official IELTS guidebooks, band descriptors, and recent question sets (2024-2025).
+- **Knowledge Base (RAG & Memory)**: Local embedding-based Retrieval-Augmented Generation for official IELTS guidebooks and persistent user memory across sessions.
 
 ## 📂 Project Structure
 
@@ -46,10 +47,13 @@
 YAXHA/
 ├── backend/                # Python FastAPI Server
 │   ├── knowledge_base/     # RAG sources & PDF benchmarks
-│   └── server.py           # AI integration & WebSocket logic
+│   ├── services/           # Decoupled microservices (LLM, TTS, Transcription)
+│   ├── core_bus.py         # Internal Event Bus for pub/sub communication
+│   ├── rag.py & memory.py  # Context and memory management via embeddings
+│   └── server.py           # WebSocket Gateway logic
 ├── src/                    # React Frontend
 │   ├── components/         # UI Elements & Visualizers
-│   ├── services/           # API & Audio streaming logic
+│   ├── services/           # Decoupled RxJS API (audio, sockets, examination)
 │   └── assets/             # Professional branding & illustrations
 └── README.md               # You are here
 ```
@@ -59,7 +63,7 @@ YAXHA/
 ### Prerequisites
 - Node.js (v18+)
 - Python 3.9+
-- Gemini API Key
+- Ollama (running locally with `llama3.2` and `nomic-embed-text` models)
 
 ### Installation
 
@@ -75,17 +79,18 @@ YAXHA/
    npm run dev
    ```
 
-3. **Backend Setup**
+3. **Ollama Setup**
+   Ensure Ollama is installed and run the following commands to pull the necessary models:
+   ```bash
+   ollama run llama3.2
+   ollama pull nomic-embed-text
+   ```
+
+4. **Backend Setup**
    ```bash
    cd backend
    pip install -r requirements.txt
    python server.py
-   ```
-
-4. **Environment Configuration**
-   Create a `.env` file in the root directory:
-   ```env
-   GEMINI_API_KEY=your_api_key_here
    ```
 
 ## ⚖️ License

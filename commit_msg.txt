@@ -1,0 +1,7 @@
+Refactor: Migrate to Event-Driven Architecture and decouple services
+
+- Migrated from a monolithic server.py to an Event-Driven Architecture (EDA) using a central core_bus to route events.
+- Replaced the Gemini API with local Ollama (llama3.2) combined with completely local Retrieval-Augmented Generation (RAG) and long-term user memory embeddings (nomic-embed-text) for improved privacy and lower latency.
+- Decoupled the backend into dedicated microservices: llm_service, transcription_service, and tts_service acting as subscribers to the event bus.
+- Refactored frontend state management to use decoupled RxJS observables (audioService, websocketService, examineeService) to coordinate interactions instead of inline React component state.
+- Updated README.md to document the new architecture, dependencies, and local setup instructions.
